@@ -1,0 +1,10 @@
+.vscode/
+data/
+# Python cache
+__pycache__/
+*.py[cod]
+
+experiments/
+# Editable install metadata
+*.egg-info/
+wandb/

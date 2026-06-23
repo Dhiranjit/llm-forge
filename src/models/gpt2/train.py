@@ -1,0 +1,326 @@
+import os
+import math
+import random
+import argparse
+import logging
+import wandb
+import numpy as np
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from .data import DataLoader, evaluate_validation_loss
+from .model import GPT2, GPTConfig
+from transformers import GPT2TokenizerFast
+
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+
+### Model Config
+block_size = 1024
+n_embd     = 768
+n_head     = 12
+n_layer    = 12
+
+### TRAINING CONFIG
+max_steps         = 35_000
+eval_interval     = 1000
+eval_iters        = 100
+global_batch_size = 256
+batch_size        = 8
+max_lr            = 6e-4
+min_lr            = 6e-5
+warmup_steps      = max_steps // 20 # 5% of max_steps
+
+
+
+
+parser = argparse.ArgumentParser(description="Train GPT2")
+parser.add_argument("--dataset", required=True)
+parser.add_argument("--resume", action="store_true")
+
+
+def set_seed(base_seed=1337, rank=0):
+    # Offset the seed for each process
+    seed = base_seed + rank
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def get_lr(step):
+    if step < warmup_steps: # Linear warmup
+        return max_lr * (step + 1) / warmup_steps
+    ratio = (step - warmup_steps) / (max_steps - warmup_steps) # [0 - 1.0]
+    # 1/2 * (1 + cos(pi*ratio)) -> [1, 0]
+    coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+def main():
+    args = parser.parse_args()
+
+    ddp = int(os.environ.get('RANK', -1)) != -1
+
+    if ddp:
+        dist.init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])              # Global ID across all nodes
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])  # ID on this specific machine
+        ddp_world_size = int(os.environ['WORLD_SIZE'])  # Total number of GPUs in the cluster
+
+        # Bind this specific process to its designated GPU
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+
+        # Setting the master process 
+        # Only the master process print, log and save the checkpoints
+        master_process = ddp_rank == 0
+    else:
+        # Fallback
+        ddp_rank = 0 
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+     
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Warning!!! Not using DDP. Running on {device}")
+
+    assert global_batch_size % (batch_size * ddp_world_size) == 0, \
+        "Global batch size must be cleanly divisible by (batch_size * world_size)"
+    
+    # Setting the seed for replication
+    set_seed(rank=ddp_rank)
+
+    # Dynamically calculate the the grad_accum_steps
+    grad_accum_steps = global_batch_size // (batch_size * ddp_world_size)
+
+    if master_process:
+        print(f"Global batch size: {global_batch_size}")
+        print(f"Gradient accumulation steps per GPU: {grad_accum_steps}")
+    
+    # Paths
+    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    data_dir     = f"/kaggle/input/{args.dataset}"
+    out_dir      = f"/kaggle/working/models/{args.dataset}"
+    log_path       = f"/kaggle/working/models/{args.dataset}/train.log"
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    # Logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),  
+            logging.StreamHandler()         
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    
+    # Find the nearest multiple of 64
+
+    config = GPTConfig(
+        vocab_size=50304, # GPT2Tokenizer vocab_size + padding
+        block_size=block_size,
+        n_embed=n_embd,
+        n_head=n_head,
+        n_layer=n_layer
+    )
+
+    # Initialize Weights & Biases
+    wandb.init(
+        project="gpt2",
+        name=f"run-{args.dataset}-{max_steps}",
+        config={
+            "batch_size": batch_size,
+            "block_size": config.block_size,
+            "max_lr": max_lr,
+            "vocab_size": config.vocab_size,
+            "grad_accum_steps": grad_accum_steps
+        }
+    )
+    
+    
+    train_loader = DataLoader(
+        data_path=data_dir,
+        split="train",
+        block_size=config.block_size,
+        batch_size=batch_size,
+        device=device,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size
+    )
+
+    val_loader = DataLoader(
+        data_path=data_dir,
+        split="val",
+        block_size=config.block_size,
+        batch_size=batch_size,
+        device=device,
+        process_rank=ddp_rank,
+        num_processes=ddp_world_size
+    )
+
+    model = GPT2(config).to(device)
+
+    params_count = sum(p.numel() for p in model.parameters())
+    print(f"{params_count/1e6:.2f}M Parameters")
+
+    if device.startswith("cuda"):
+        model = torch.compile(model)
+
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+
+    raw_model =  model.module if ddp else model
+
+    # Separate parameters for proper weight decay application
+    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': 0.1},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=max_lr, fused=True)
+    
+    # Mixed precision training context
+    scaler = torch.amp.GradScaler()
+
+    # Training Loop
+    start_step = 0
+    best_val_loss = float('inf')
+    running_train_loss = 0.0
+
+    # Resume logic
+    if args.resume:
+        ckpt_path = f"/kaggle/working/models/{args.dataset}/ckpt_latest.pt"
+        if os.path.exists(ckpt_path):
+            if master_process:
+                logger.info(f"Resuming training from {ckpt_path}")
+            
+            checkpoint = torch.load(ckpt_path, map_location=device)
+
+            raw_model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scaler.load_state_dict(checkpoint["scaler"])
+
+            train_loader.load_state_dict(checkpoint["train_loader"])
+
+            start_step = checkpoint["step"] + 1
+            best_val_loss = checkpoint.get("val_loss", float('inf'))
+
+            if "rng_state" in checkpoint:
+                torch.set_rng_state(checkpoint["rng_state"])
+            if "cuda_rng_state" in checkpoint and torch.cuda.is_available():
+                torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+
+        else:
+            if master_process:
+                logger.info(f"Resume flag set, but no checkpoint found at {ckpt_path}. Starting fresh training...")
+    
+
+    for step in range(start_step, max_steps):
+
+        lr = get_lr(step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
+        loss_accum = 0.0
+
+        # Gradient accumulation 
+        for accum_step in range(grad_accum_steps):
+            xb, yb = train_loader.next_batch() 
+            is_last_step = (accum_step == grad_accum_steps - 1)
+            
+            if ddp:
+                # Only sync gradients across GPUs on the last accum_step
+                model.require_backward_grad_sync = is_last_step
+            
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                _, loss = model(xb, yb)
+                loss = loss/grad_accum_steps
+            
+            # Scaling the gradients as we are using fp16
+            scaled_loss = scaler.scale(loss) # loss is scaled and
+            scaled_loss.backward() # as a result the gradients (param.grad) are also scaled which prevents underflow
+            loss_accum += loss.item()
+        
+        # Unscale the gradients before clipping
+        scaler.unscale_(optimizer)
+        # Clip gradients and step the optimizer once per large batch
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # Skips the optimization if gradients overflow or underflow
+        scaler.step(optimizer) 
+        # Reduces the scale automatically if gradients overflow
+        # Increases the scale if multiple steps are succesfull to prevent better underflow
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+
+        if master_process:
+            
+            wandb.log({
+                "train/loss": loss_accum,
+                "train/lr": lr
+            }, step=step)
+
+            # Exponential moving average for smoothing the loss
+            if step == 0:
+                running_train_loss = loss_accum
+                logger.info(f"Step 0 | Initialization Loss: {running_train_loss:.4f}")
+            else:
+                running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
+
+            if step % 100 == 0:
+                logger.info(f"Step {step:5d} | Train Loss (Smoothed): {running_train_loss:.4f} | LR: {lr:.4e}")
+
+        # --- EVALUATION & CHECKPOINTING ---
+        if step >  0 and (step % eval_interval == 0 or step == max_steps - 1):
+            
+            val_loss = evaluate_validation_loss(
+                model, 
+                val_loader, 
+                total_eval_iters=eval_iters, 
+                process_rank=ddp_rank, 
+                num_processes=ddp_world_size
+            )
+
+            if master_process:
+
+                logger.info(f"EVAL | Step: {step:5d}  | Val Loss: {val_loss:.4f}")
+                wandb.log({"loss/val": val_loss,}, step=step)
+                
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "train_loader": train_loader.state_dict(),
+                    "step": step,
+                    "config": dict(config),
+                    "val_loss": val_loss,
+                    "rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": torch.cuda.get_rng_state()
+                }
+
+                # Always save the latest state for crash recovery
+                torch.save(checkpoint, f"{out_dir}/ckpt_latest.pt")
+
+                # Save if the model has a better val_loss
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(checkpoint, f"{out_dir}/ckpt_best.pt")
+                    logger.info(f"New best model saved with Val Loss: {best_val_loss:.4f}")
+                
+    if ddp:
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()

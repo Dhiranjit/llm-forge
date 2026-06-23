@@ -12,7 +12,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .data import DataLoader, evaluate_validation_loss
 from .model import GPT2, GPTConfig
-from transformers import GPT2TokenizerFast
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -31,7 +30,7 @@ max_steps         = 35_000
 eval_interval     = 1000
 eval_iters        = 100
 global_batch_size = 256
-batch_size        = 8
+batch_size        = 16
 max_lr            = 6e-4
 min_lr            = 6e-5
 warmup_steps      = max_steps // 20 # 5% of max_steps
@@ -113,16 +112,7 @@ def main():
     log_path       = f"{out_dir}/train.log"
     os.makedirs(out_dir, exist_ok=True)
 
-    # Logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(message)s",
-        handlers=[
-            logging.FileHandler(log_path),  
-            logging.StreamHandler()         
-        ]
-    )
-    logger = logging.getLogger(__name__)
+
     
     # Find the nearest multiple of 64
 
@@ -134,11 +124,22 @@ def main():
         n_layer=n_layer
     )
 
-    # Initialize Weights & Biases
+
     if master_process:
+        # Logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s | %(message)s",
+            handlers=[
+                logging.FileHandler(log_path),  
+                logging.StreamHandler()         
+            ]
+        )
+
+        # Initialize Weights & Biases
         wandb.init(
             project="gpt2",
-            name=f"run-{args.dataset_path}-{max_steps}",
+            name=f"run-fineWebEdu-{max_steps}",
             config={
                 "batch_size": batch_size,
                 "block_size": config.block_size,
@@ -147,6 +148,8 @@ def main():
                 "grad_accum_steps": grad_accum_steps
             }
         )
+        
+    logger = logging.getLogger(__name__)
     
     
     train_loader = DataLoader(
@@ -257,7 +260,7 @@ def main():
         
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-            
+
         loss_accum = loss_accum.item()
         
         # Unscale the gradients before clipping

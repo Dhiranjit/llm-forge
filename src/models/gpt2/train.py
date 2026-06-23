@@ -5,6 +5,7 @@ import argparse
 import logging
 import wandb
 import numpy as np
+import dataclasses
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -39,7 +40,7 @@ warmup_steps      = max_steps // 20 # 5% of max_steps
 
 
 parser = argparse.ArgumentParser(description="Train GPT2")
-parser.add_argument("--dataset", required=True)
+parser.add_argument("--dataset-path", required=True)
 parser.add_argument("--resume", action="store_true")
 
 
@@ -107,10 +108,10 @@ def main():
     
     # Paths
     device  = "cuda" if torch.cuda.is_available() else "cpu"
-    data_dir     = f"/kaggle/input/{args.dataset}"
-    out_dir      = f"/kaggle/working/models/{args.dataset}"
-    log_path       = f"/kaggle/working/models/{args.dataset}/train.log"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    data_dir     = args.dataset_path
+    out_dir      = f"/kaggle/working/models/GPT2"
+    log_path       = f"{out_dir}/train.log"
+    os.makedirs(out_dir, exist_ok=True)
 
     # Logging
     logging.basicConfig(
@@ -134,17 +135,18 @@ def main():
     )
 
     # Initialize Weights & Biases
-    wandb.init(
-        project="gpt2",
-        name=f"run-{args.dataset}-{max_steps}",
-        config={
-            "batch_size": batch_size,
-            "block_size": config.block_size,
-            "max_lr": max_lr,
-            "vocab_size": config.vocab_size,
-            "grad_accum_steps": grad_accum_steps
-        }
-    )
+    if master_process:
+        wandb.init(
+            project="gpt2",
+            name=f"run-{args.dataset_path}-{max_steps}",
+            config={
+                "batch_size": batch_size,
+                "block_size": config.block_size,
+                "max_lr": max_lr,
+                "vocab_size": config.vocab_size,
+                "grad_accum_steps": grad_accum_steps
+            }
+        )
     
     
     train_loader = DataLoader(
@@ -201,12 +203,12 @@ def main():
 
     # Resume logic
     if args.resume:
-        ckpt_path = f"/kaggle/working/models/{args.dataset}/ckpt_latest.pt"
+        ckpt_path = f"{out_dir}/ckpt_latest.pt"
         if os.path.exists(ckpt_path):
             if master_process:
                 logger.info(f"Resuming training from {ckpt_path}")
             
-            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
 
             raw_model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -233,7 +235,7 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        loss_accum = 0.0
+        loss_accum = torch.tensor(0.0, device=device)
 
         # Gradient accumulation 
         for accum_step in range(grad_accum_steps):
@@ -251,7 +253,12 @@ def main():
             # Scaling the gradients as we are using fp16
             scaled_loss = scaler.scale(loss) # loss is scaled and
             scaled_loss.backward() # as a result the gradients (param.grad) are also scaled which prevents underflow
-            loss_accum += loss.item()
+            loss_accum += loss.detach()
+        
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            
+        loss_accum = loss_accum.item()
         
         # Unscale the gradients before clipping
         scaler.unscale_(optimizer)
@@ -304,7 +311,7 @@ def main():
                     "scaler": scaler.state_dict(),
                     "train_loader": train_loader.state_dict(),
                     "step": step,
-                    "config": dict(config),
+                    "config": dataclasses.asdict(config),
                     "val_loss": val_loss,
                     "rng_state": torch.get_rng_state(),
                     "cuda_rng_state": torch.cuda.get_rng_state()

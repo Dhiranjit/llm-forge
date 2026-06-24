@@ -47,13 +47,15 @@ class DataLoader:
         """Returns the state of the dataloader."""
         return {
             "current_shard_idx": self.current_shard_idx,
-            "current_postion": self.current_position
+            "current_position": self.current_position
         }
 
     def load_state_dict(self, state):
         """Restores the state of the dataloader."""
-        self.current_shard_idx = state["current_shard_idx "]
-        self.current_position = state["current_position"]
+        self.current_shard_idx = state["current_shard_idx"]
+        # Since the state is saved by Rank 0, we need to offset this for every rank.
+        base_position = state["current_position"]
+        self.current_position = base_position + (self.batch_size * self.block_size * self.process_rank)
         self.data = self._load_shard(self.current_shard_idx)
 
     def next_batch(self):

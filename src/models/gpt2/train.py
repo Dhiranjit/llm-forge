@@ -103,6 +103,7 @@ def main():
 
     if master_process:
         print(f"Global batch size: {global_batch_size}")
+        print(f"Batch size: {batch_size}")
         print(f"Gradient accumulation steps per GPU: {grad_accum_steps}")
     
     # Paths

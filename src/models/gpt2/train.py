@@ -174,8 +174,9 @@ def main():
 
     model = GPT2(config).to(device)
 
-    params_count = sum(p.numel() for p in model.parameters())
-    print(f"{params_count/1e6:.2f}M Parameters")
+    if master_process:
+        params_count = sum(p.numel() for p in model.parameters())
+        print(f"{params_count/1e6:.2f}M Parameters")
 
     if device.startswith("cuda"):
         model = torch.compile(model)
@@ -285,7 +286,6 @@ def main():
             # Exponential moving average for smoothing the loss
             if step == 0:
                 running_train_loss = loss_accum
-                logger.info(f"Step 0 | Initialization Loss: {running_train_loss:.4f}")
             else:
                 running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
 

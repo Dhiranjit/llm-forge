@@ -90,22 +90,23 @@ class DataLoader:
         
 
 @torch.no_grad()
-def evaluate_validation_loss(model, val_loader: DataLoader, eval_iters, process_rank, num_processes):
+def evaluate_validation_loss(model, val_loader, eval_iters, num_processes):
     model.eval()
 
     losses = torch.zeros(eval_iters, device=val_loader.device)
-
     val_loader.reset()
 
-    for k in range(eval_iters):
-        x, y = val_loader.next_batch()
-        _, loss = model(x, y)
-        losses[k] = loss
-    
-    # Synchronize across GPUs
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        for k in range(eval_iters):
+            x, y = val_loader.next_batch()
+            _, loss = model(x, y)
+            losses[k] = loss
+
     mean_loss = losses.mean()
-    dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
-    mean_loss /= num_processes
+
+    if num_processes > 1:
+        dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
+        mean_loss /= num_processes
 
     model.train()
     return mean_loss.item()

@@ -275,7 +275,19 @@ def main():
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
         loss_accum = loss_accum.item()
+
+        if  master_process:
+            if step == start_step:
+                running_train_loss = loss_accum
+            else:
+                running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
+            
+            wandb.log({
+                "train/loss": loss_accum,
+                "train/lr": lr,
+            }, step=step)
         
+
         # Unscale the gradients before clipping
         scaler.unscale_(optimizer)
         # Clip gradients and step the optimizer once per large batch
@@ -285,13 +297,7 @@ def main():
         # Reduces the scale automatically if gradients overflow
         # Increases the scale if multiple steps are succesfull to prevent better underflow
         scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-
-        if master_process:
-            wandb.log({
-                "train/loss": loss_accum,
-                "train/lr": lr,
-            }, step=step)
+        optimizer.zero_grad(set_to_none=True)  
 
         if step == start_step:
             if device.startswith("cuda"):
@@ -299,14 +305,12 @@ def main():
             t0 = time.time()
             
             if master_process:
-                running_train_loss = loss_accum
                 logger.info(
                     f"Step {step:5d} | "
                     f"Init Loss: {loss_accum:.4f} | "
                     f"LR: {lr:.4e} | "
                     f"(Compiling model, skipping perf metrics)"
                 )
-
 
         elif step % 100 == 0:
             if device.startswith("cuda"):
@@ -330,13 +334,6 @@ def main():
                     "perf/toks_sec": tokens_per_sec,
                     "perf/mfu": mfu_percentage
                 }, step=step)
-
-                # Exponential moving average for smoothing the loss
-                if running_train_loss == 0.0:
-                    running_train_loss = loss_accum
-
-                else:
-                    running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
 
                 logger.info(
                     f"Step {step:5d} | "

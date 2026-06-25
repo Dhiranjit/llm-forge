@@ -1,4 +1,5 @@
 import os
+import time
 import math
 import random
 import argparse
@@ -16,6 +17,10 @@ from .model import GPT2, GPTConfig
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+
+
 
 
 
@@ -180,11 +185,13 @@ def main():
         params_count = sum(p.numel() for p in model.parameters())
         print(f"{params_count/1e6:.2f}M Parameters")
 
-    if device.startswith("cuda"):
-        model = torch.compile(model)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
+    
+    
+    if device.startswith("cuda"):
+        model = torch.compile(model)
 
     raw_model =  model.module if ddp else model
 
@@ -237,6 +244,8 @@ def main():
             if master_process:
                 logger.info(f"Resume flag set, but no checkpoint found at {ckpt_path}. Starting fresh training...")
     
+    # toks/sec
+    t0 = time.time()
 
     for step in range(start_step, max_steps):
 
@@ -280,24 +289,68 @@ def main():
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
-
-        if master_process:
+        if step == start_step:
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+            t0 = time.time()
             
-            wandb.log({
-                "train/loss": loss_accum,
-                "train/lr": lr
-            }, step=step)
-
-            # Exponential moving average for smoothing the loss
-            if step == 0:
+            if master_process:
                 running_train_loss = loss_accum
-            else:
-                running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
+                wandb.log({
+                    "train/loss": loss_accum,
+                    "train/lr": lr
+                }, step=step)
+                
+                logger.info(
+                    f"Step {step:5d} | "
+                    f"Init Loss: {loss_accum:.4f} | "
+                    f"LR: {lr:.4e} | "
+                    f"(Compiling model, skipping perf metrics)"
+                )
 
-            if step % 100 == 0:
-                logger.info(f"Step {step:5d} | Train Loss (Smoothed): {running_train_loss:.4f} | LR: {lr:.4e}")
 
-        # --- EVALUATION & CHECKPOINTING ---
+        elif step % 100 == 0:
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+            
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1 # Reset the clock
+            if master_process:
+
+                tokens_processed = global_batch_size * config.block_size * 100
+                tokens_per_sec = tokens_processed / dt
+
+                peak_flops_promised = 65e12 * ddp_world_size
+
+                flops_per_token = 6 * params_count
+                observed_flops_per_sec = flops_per_token * tokens_per_sec
+                mfu_percentage = (observed_flops_per_sec / peak_flops_promised) * 100
+
+                wandb.log({
+                    "train/loss": loss_accum,
+                    "train/lr": lr,
+                    "perf/toks_sec": tokens_per_sec,
+                    "perf/mfu": mfu_percentage
+                }, step=step)
+
+                # Exponential moving average for smoothing the loss
+                if running_train_loss == 0.0:
+                    running_train_loss = loss_accum
+
+                else:
+                    running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
+
+                logger.info(
+                    f"Step {step:5d} | "
+                    f"Loss: {running_train_loss:.4f} | "
+                    f"LR: {lr:.4e} | "
+                    f"Tok/s: {tokens_per_sec:.0f} | "
+                    f"MFU: {mfu_percentage:.1f}%"
+                )
+
+
+        # Evaluation and Checkpointing
         if step >  0 and (step % eval_interval == 0 or step == max_steps - 1):
             
             val_loss = evaluate_validation_loss(
@@ -333,6 +386,14 @@ def main():
                     best_val_loss = val_loss
                     torch.save(checkpoint, f"{out_dir}/ckpt_best.pt")
                     logger.info(f"New best model saved with Val Loss: {best_val_loss:.4f}")
+            
+            if ddp:
+                dist.barrier()
+            
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+            
+            t0 = time.time()
                 
     if ddp:
         dist.destroy_process_group()

@@ -202,12 +202,6 @@ def main():
     ]
     optimizer = torch.optim.AdamW(optim_groups, lr=max_lr, fused=True)
     
-    if device.startswith("cuda"):
-        model = torch.compile(model)
-
-
-    
-    
     # Mixed precision training context
     scaler = torch.amp.GradScaler()
 
@@ -225,9 +219,14 @@ def main():
             if master_process:
                 logger.info(f"Resuming training from {ckpt_path}")
             
-            
-
-            raw_model.load_state_dict(checkpoint["model"])
+            state_dict = checkpoint["model"]
+            # Handle checkpoints saved from torch.compile()
+            if next(iter(state_dict)).startswith("_orig_mod."):
+                state_dict = {
+                    k.replace("_orig_mod.", "", 1): v
+                    for k, v in state_dict.items()
+                }
+            raw_model.load_state_dict(state_dict)
             optimizer.load_state_dict(checkpoint["optimizer"])
             scaler.load_state_dict(checkpoint["scaler"])
 
@@ -242,6 +241,10 @@ def main():
             if master_process:
                 logger.info(f"Resume flag set, but no checkpoint found at {ckpt_path}. Starting fresh training...")
     
+    if device.startswith("cuda"):
+        model = torch.compile(model)
+
+
     # toks/sec
     t0 = time.time()
 

@@ -90,7 +90,7 @@ class DataLoader:
         
 
 @torch.no_grad()
-def evaluate_validation_loss(model, val_loader, eval_iters, num_processes):
+def evaluate_validation_loss(model, val_loader, eval_iters):
     model.eval()
 
     losses = torch.zeros(eval_iters, device=val_loader.device)
@@ -104,9 +104,9 @@ def evaluate_validation_loss(model, val_loader, eval_iters, num_processes):
 
     mean_loss = losses.mean()
 
-    if num_processes > 1:
+    if dist.is_initialized():
         dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
-        mean_loss /= num_processes
+        mean_loss /= dist.get_world_size()
 
     model.train()
     return mean_loss.item()

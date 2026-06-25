@@ -1,4 +1,3 @@
-from typing import Any
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -9,11 +8,11 @@ import torch.nn.functional as F
 
 @dataclass
 class GPTConfig:
-    vocab_size : int = 32768
-    block_size : int = 256
-    n_embed    : int = 384
-    n_head     : int = 8
-    n_layer    : int = 8
+    vocab_size : int = 50304
+    block_size : int = 1024
+    n_embed    : int = 768
+    n_head     : int = 12
+    n_layer    : int = 12
 
 
 class CausalSelfAttention(nn.Module):

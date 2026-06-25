@@ -186,14 +186,10 @@ def main():
         print(f"{params_count/1e6:.2f}M Parameters")
 
 
+    raw_model = model
+
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
-    
-    
-    if device.startswith("cuda"):
-        model = torch.compile(model)
-
-    raw_model =  model.module if ddp else model
 
     # Separate parameters for proper weight decay application
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
@@ -205,6 +201,12 @@ def main():
         {'params': nodecay_params, 'weight_decay': 0.0}
     ]
     optimizer = torch.optim.AdamW(optim_groups, lr=max_lr, fused=True)
+    
+    if device.startswith("cuda"):
+        model = torch.compile(model)
+
+
+    
     
     # Mixed precision training context
     scaler = torch.amp.GradScaler()
@@ -221,10 +223,6 @@ def main():
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
 
             if master_process:
-                if "rng_state" in checkpoint:
-                    torch.set_rng_state(checkpoint["rng_state"])
-                if "cuda_rng_state" in checkpoint and torch.cuda.is_available():
-                    torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
                 logger.info(f"Resuming training from {ckpt_path}")
             
             
@@ -289,6 +287,12 @@ def main():
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
+        if master_process:
+            wandb.log({
+                "train/loss": loss_accum,
+                "train/lr": lr,
+            }, step=step)
+
         if step == start_step:
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
@@ -296,11 +300,6 @@ def main():
             
             if master_process:
                 running_train_loss = loss_accum
-                wandb.log({
-                    "train/loss": loss_accum,
-                    "train/lr": lr
-                }, step=step)
-                
                 logger.info(
                     f"Step {step:5d} | "
                     f"Init Loss: {loss_accum:.4f} | "
@@ -328,8 +327,6 @@ def main():
                 mfu_percentage = (observed_flops_per_sec / peak_flops_promised) * 100
 
                 wandb.log({
-                    "train/loss": loss_accum,
-                    "train/lr": lr,
                     "perf/toks_sec": tokens_per_sec,
                     "perf/mfu": mfu_percentage
                 }, step=step)
@@ -364,7 +361,7 @@ def main():
             if master_process:
 
                 logger.info(f"EVAL | Step: {step:5d}  | Val Loss: {val_loss:.4f}")
-                wandb.log({"loss/val": val_loss,}, step=step)
+                wandb.log({"val/loss": val_loss,}, step=step)
                 
                 checkpoint = {
                     "model": raw_model.state_dict(),
@@ -373,9 +370,7 @@ def main():
                     "train_loader": train_loader.state_dict(),
                     "step": step,
                     "config": dataclasses.asdict(config),
-                    "val_loss": val_loss,
-                    "rng_state": torch.get_rng_state(),
-                    "cuda_rng_state": torch.cuda.get_rng_state()
+                    "val_loss": val_loss
                 }
 
                 # Always save the latest state for crash recovery

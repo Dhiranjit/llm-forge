@@ -26,6 +26,7 @@ n_head     = 12
 n_layer    = 12
 
 ### TRAINING CONFIG
+vocab_size_padded = 50304           # GPT2Tokenizer vocab_size + padding
 max_steps         = 35_000
 eval_interval     = 1000
 eval_iters        = 100
@@ -89,6 +90,7 @@ def main():
         ddp_world_size = 1
         master_process = True
      
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Warning!!! Not using DDP. Running on {device}")
 
@@ -107,7 +109,6 @@ def main():
         print(f"Gradient accumulation steps per GPU: {grad_accum_steps}")
     
     # Paths
-    device  = "cuda" if torch.cuda.is_available() else "cpu"
     data_dir     = args.dataset_path
     out_dir      = f"/kaggle/working/models/GPT2"
     log_path       = f"{out_dir}/train.log"
@@ -118,7 +119,7 @@ def main():
     # Find the nearest multiple of 64
 
     config = GPTConfig(
-        vocab_size=50304, # GPT2Tokenizer vocab_size + padding
+        vocab_size=vocab_size_padded, 
         block_size=block_size,
         n_embed=n_embd,
         n_head=n_head,
@@ -210,10 +211,16 @@ def main():
     if args.resume:
         ckpt_path = f"{out_dir}/ckpt_latest.pt"
         if os.path.exists(ckpt_path):
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+
             if master_process:
+                if "rng_state" in checkpoint:
+                    torch.set_rng_state(checkpoint["rng_state"])
+                if "cuda_rng_state" in checkpoint and torch.cuda.is_available():
+                    torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
                 logger.info(f"Resuming training from {ckpt_path}")
             
-            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            
 
             raw_model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -224,10 +231,7 @@ def main():
             start_step = checkpoint["step"] + 1
             best_val_loss = checkpoint.get("val_loss", float('inf'))
 
-            if "rng_state" in checkpoint:
-                torch.set_rng_state(checkpoint["rng_state"])
-            if "cuda_rng_state" in checkpoint and torch.cuda.is_available():
-                torch.cuda.set_rng_state(checkpoint["cuda_rng_state"])
+            
 
         else:
             if master_process:
@@ -299,7 +303,7 @@ def main():
             val_loss = evaluate_validation_loss(
                 model, 
                 val_loader, 
-                total_eval_iters=eval_iters, 
+                eval_iters=eval_iters, 
                 process_rank=ddp_rank, 
                 num_processes=ddp_world_size
             )

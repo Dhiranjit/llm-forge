@@ -90,7 +90,7 @@ class DataLoader:
         
 
 @torch.no_grad()
-def evaluate_validation_loss(model,val_loader: DataLoader, eval_iters, process_rank, num_processes):
+def evaluate_validation_loss(model, val_loader: DataLoader, eval_iters, process_rank, num_processes):
     model.eval()
 
     losses = torch.zeros(eval_iters, device=val_loader.device)

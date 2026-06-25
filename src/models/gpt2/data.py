@@ -27,15 +27,18 @@ class DataLoader:
         self.current_shard_idx = 0
         self.data = self._load_shard(self.current_shard_idx)
         
-        # For cuda:0 -> current_position = 0 && cuda:1 -> current_postion = batch_size * block_size * 1
-        # This makes sure that their batches never overlap.
-        self.current_position = self.batch_size * self.block_size * self.process_rank
+        # GLOBAL Position. Every rank starts exactly at 0.
+        self.current_position = 0
+
+        # # For cuda:0 -> current_position = 0 && cuda:1 -> current_postion = batch_size * block_size * 1
+        # # This makes sure that their batches never overlap.
+        # self.current_position = self.batch_size * self.block_size * self.process_rank
 
 
     def reset(self):
         self.current_shard_idx = 0
         self.data = self._load_shard(self.current_shard_idx)
-        self.current_position = self.batch_size * self.block_size * self.process_rank
+        self.current_position = 0
 
 
     def _load_shard(self, shard_idx):
@@ -51,61 +54,50 @@ class DataLoader:
         }
 
     def load_state_dict(self, state):
-        """Restores the state of the dataloader."""
+        """Restores the state of the dataloader and safely re-applies DDP offsets."""
         self.current_shard_idx = state["current_shard_idx"]
-        # Since the state is saved by Rank 0, we need to offset this for every rank.
-        base_position = state["current_position"]
-        self.current_position = base_position + (self.batch_size * self.block_size * self.process_rank)
+        self.current_position = state["current_position"]
         self.data = self._load_shard(self.current_shard_idx)
+        
 
     def next_batch(self):
-        """
-        Sequentially load shards and sample batches sequentially.
+        B, T = self.batch_size, self.block_size
 
-        In DDP mode, each process reads from the same shards but starts at
-        diffenrent offset to avoid overlapping samples.
-        """
-        # Tokens consumed by one GPU in a single batch
-        B = self.batch_size
-        T = self.block_size
+        # Offset for this specific GPU.
+        rank_offset = B * T * self.process_rank
 
         # Buffer from the current shard (for both x & y)
-        buff = self.data[self.current_position : self.current_position + B * T + 1]
+        buff = self.data[self.current_position + rank_offset : self.current_position + rank_offset +  B * T + 1]
 
-        x = torch.from_numpy(buff[:-1].astype(np.int64)).view(B, T).to(self.device)
-        y = torch.from_numpy(buff[1: ].astype(np.int64)).view(B, T).to(self.device)
+        x_tensor = torch.from_numpy(buff[:-1].astype(np.int64)).view(B, T)
+        y_tensor = torch.from_numpy(buff[1: ].astype(np.int64)).view(B, T)
 
-        # Advance the current_postion
+        x = x_tensor.pin_memory().to(self.device, non_blocking=True)
+        y = y_tensor.pin_memory().to(self.device, non_blocking=True)
+
+        # Advance the global pointer by the total tokens consumed by all GPUS
         self.current_position += B * T * self.num_processes
 
         ### Shard transition
-        # If the next batch results in an out-of bound error
+        # If the next global step will exceed the shard length
+        # This guarantees all GPUs transition shards at the exact same moment
         if self.current_position + (B * T * self.num_processes + 1) > len(self.data):
-            # Advance to the next shard
-            self.current_shard_idx += 1
-
-            # If we hit the end of the shard then wrap around the beginning
-            if self.current_shard_idx == len(self.shards):
-                self.current_shard_idx = 0
-            
+            self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shards)
             self.data = self._load_shard(self.current_shard_idx)
-            # Reset the position for the new shard, according to the process rank
-            self.current_position = B * T * self.process_rank
+            self.current_position = 0
 
         return x, y
-
+        
 
 @torch.no_grad()
-def evaluate_validation_loss(model,val_loader: DataLoader, total_eval_iters, process_rank, num_processes):
+def evaluate_validation_loss(model,val_loader: DataLoader, eval_iters, process_rank, num_processes):
     model.eval()
-    
-    eval_iters_per_process = total_eval_iters // num_processes
 
-    losses = torch.zeros(eval_iters_per_process, device=model.device)
+    losses = torch.zeros(eval_iters, device=val_loader.device)
 
     val_loader.reset()
 
-    for k in range(eval_iters_per_process):
+    for k in range(eval_iters):
         x, y = val_loader.next_batch()
         _, loss = model(x, y)
         losses[k] = loss

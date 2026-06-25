@@ -352,10 +352,8 @@ def main():
             
             val_loss = evaluate_validation_loss(
                 model, 
-                val_loader, 
-                eval_iters=eval_iters, 
-                process_rank=ddp_rank, 
-                num_processes=ddp_world_size
+                val_loader,
+                eval_iters
             )
 
             if master_process:

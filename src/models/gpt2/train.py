@@ -239,7 +239,7 @@ def main():
 
 
     # toks/sec
-    t0 = time.time()
+    t0 = time.perf_counter()
 
     for step in range(start_step, max_steps):
 
@@ -298,7 +298,7 @@ def main():
         if step == start_step:
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
-            t0 = time.time()
+            t0 = time.perf_counter()
             
             if master_process:
                 logger.info(
@@ -312,7 +312,7 @@ def main():
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
             
-            t1 = time.time()
+            t1 = time.perf_counter()
             dt = t1 - t0
             t0 = t1 # Reset the clock
             if master_process:
@@ -320,23 +320,17 @@ def main():
                 tokens_processed = global_batch_size * config.block_size * stats_iter
                 tokens_per_sec = tokens_processed / dt
 
-                peak_flops_promised = 65e12 * ddp_world_size
-
-                flops_per_token = 6 * params_count
-                observed_flops_per_sec = flops_per_token * tokens_per_sec
-                mfu_percentage = (observed_flops_per_sec / peak_flops_promised) * stats_iter
 
                 wandb.log({
                     "perf/toks_sec": tokens_per_sec,
-                    "perf/mfu": mfu_percentage
                 }, step=step)
 
                 logger.info(
                     f"Step {step:5d} | "
                     f"Loss: {running_train_loss:.4f} | "
                     f"LR: {lr:.4e} | "
-                    f"Tok/s: {tokens_per_sec:.0f} | "
-                    f"MFU: {mfu_percentage:.1f}%"
+                    f"Tok/s: {tokens_per_sec:.0f}"
+
                 )
 
 

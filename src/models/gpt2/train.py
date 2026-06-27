@@ -26,8 +26,9 @@ n_layer    = 12
 ### TRAINING CONFIG
 vocab_size_padded = 50304           # GPT2Tokenizer vocab_size + padding
 max_steps         = 35_000
-eval_interval     = 100
-eval_iters        = 10
+eval_interval     = 50
+eval_iters        = 50
+stats_iter        = 10
 global_batch_size = 256
 batch_size        = 16
 max_lr            = 6e-4
@@ -307,7 +308,7 @@ def main():
                     f"(Compiling model, skipping perf metrics)"
                 )
 
-        elif step % 100 == 0:
+        elif step % stats_iter == 0:
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
             
@@ -316,14 +317,14 @@ def main():
             t0 = t1 # Reset the clock
             if master_process:
 
-                tokens_processed = global_batch_size * config.block_size * 100
+                tokens_processed = global_batch_size * config.block_size * stats_iter
                 tokens_per_sec = tokens_processed / dt
 
                 peak_flops_promised = 65e12 * ddp_world_size
 
                 flops_per_token = 6 * params_count
                 observed_flops_per_sec = flops_per_token * tokens_per_sec
-                mfu_percentage = (observed_flops_per_sec / peak_flops_promised) * 100
+                mfu_percentage = (observed_flops_per_sec / peak_flops_promised) * stats_iter
 
                 wandb.log({
                     "perf/toks_sec": tokens_per_sec,

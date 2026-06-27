@@ -10,16 +10,9 @@ import dataclasses
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+import contextlib
 from .data import DataLoader, evaluate_validation_loss
 from .model import GPT2, GPTConfig
-
-torch.set_float32_matmul_precision("high")
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-
-
 
 
 
@@ -40,8 +33,6 @@ batch_size        = 16
 max_lr            = 6e-4
 min_lr            = 6e-5
 warmup_steps      = max_steps // 20 # 5% of max_steps
-
-
 
 
 parser = argparse.ArgumentParser(description="Train GPT2")
@@ -65,7 +56,6 @@ def get_lr(step):
     if step < warmup_steps: # Linear warmup
         return max_lr * (step + 1) / warmup_steps
     ratio = (step - warmup_steps) / (max_steps - warmup_steps) # [0 - 1.0]
-    # 1/2 * (1 + cos(pi*ratio)) -> [1, 0]
     coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
@@ -94,7 +84,6 @@ def main():
         ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
-     
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Warning!!! Not using DDP. Running on {device}")
@@ -115,22 +104,18 @@ def main():
     
     # Paths
     data_dir     = args.dataset_path
-    out_dir      = f"/kaggle/working/models/GPT2"
-    log_path       = f"{out_dir}/train.log"
+    out_dir      = f"/kaggle/working/models/"
+    log_path     = f"{out_dir}/train.log"
+    ckpt_path    = f"{out_dir}/ckpt_latest.pt"
     os.makedirs(out_dir, exist_ok=True)
-
-
-    
-    # Find the nearest multiple of 64
 
     config = GPTConfig(
         vocab_size=vocab_size_padded, 
         block_size=block_size,
-        n_embed=n_embd,
+        n_embd=n_embd,
         n_head=n_head,
         n_layer=n_layer
     )
-
 
     if master_process:
         # Logging
@@ -143,15 +128,33 @@ def main():
             ]
         )
 
-        # Initialize Weights & Biases
+        # Check for wandb run ID before wandb
+        wandb_id = None
+
+        if args.resume:
+            if os.path.exists(ckpt_path):
+                try:
+                    checkpoint_meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                    wandb_id = checkpoint_meta.get("wandb_id", None)
+                except Exception as e:
+                    print(f"Warning: Could not extract wandb_id from checkpoint: {e}")
+                
+
+
+        # Initialize Weights & Biases with the existing ID to resume seamlessly
         wandb.init(
-            project="gpt2",
+            project="GPT2(124M)",
             name=f"run-fineWebEdu-{max_steps}",
+            id=wandb_id,
+            resume="allow" if wandb_id else None,
             config={
                 "batch_size": batch_size,
-                "block_size": config.block_size,
+                "block_size": block_size,
+                "n_embd"    : n_embd,
+                "n_head"    : n_head,
+                "n_layers"  : n_layer,
                 "max_lr": max_lr,
-                "vocab_size": config.vocab_size,
+                "vocab_size": vocab_size_padded,
                 "grad_accum_steps": grad_accum_steps
             }
         )
@@ -179,20 +182,17 @@ def main():
         num_processes=ddp_world_size
     )
 
+    # Model Initialization
     model = GPT2(config).to(device)
+    raw_model = model # Pure reference for clean checkpoints
 
     if master_process:
         params_count = sum(p.numel() for p in model.parameters())
         print(f"{params_count/1e6:.2f}M Parameters")
 
 
-    raw_model = model
-
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
-
-    # Separate parameters for proper weight decay application
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    # Parameter seperation on raw_model for proper weight decay.
+    param_dict = {pn: p for pn, p in raw_model.named_parameters() if p.requires_grad}
     decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
 
@@ -205,44 +205,36 @@ def main():
     # Mixed precision training context
     scaler = torch.amp.GradScaler()
 
-    # Training Loop
+    # Training Loop States
     start_step = 0
     best_val_loss = float('inf')
     running_train_loss = 0.0
 
     # Resume logic
     if args.resume:
-        ckpt_path = f"{out_dir}/ckpt_latest.pt"
         if os.path.exists(ckpt_path):
             checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
 
             if master_process:
                 logger.info(f"Resuming training from {ckpt_path}")
             
-            state_dict = checkpoint["model"]
-            # Handle checkpoints saved from torch.compile()
-            if next(iter(state_dict)).startswith("_orig_mod."):
-                state_dict = {
-                    k.replace("_orig_mod.", "", 1): v
-                    for k, v in state_dict.items()
-                }
-            raw_model.load_state_dict(state_dict)
+            raw_model.load_state_dict(checkpoint["model"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             scaler.load_state_dict(checkpoint["scaler"])
 
             train_loader.load_state_dict(checkpoint["train_loader"])
 
             start_step = checkpoint["step"] + 1
-            best_val_loss = checkpoint.get("val_loss", float('inf'))
-
-            
-
+            best_val_loss = checkpoint.get("best_val_loss", float('inf'))
+            running_train_loss = checkpoint.get("running_train_loss", 0.0)
         else:
             if master_process:
                 logger.info(f"Resume flag set, but no checkpoint found at {ckpt_path}. Starting fresh training...")
     
-    if device.startswith("cuda"):
-        model = torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    
+    model = torch.compile(model)
 
 
     # toks/sec
@@ -261,18 +253,18 @@ def main():
             xb, yb = train_loader.next_batch() 
             is_last_step = (accum_step == grad_accum_steps - 1)
             
-            if ddp:
-                # Only sync gradients across GPUs on the last accum_step
-                model.require_backward_grad_sync = is_last_step
+            # To prevent recompuation of gradients
+            context = model.no_sync() if ddp and not is_last_step else contextlib.nullcontext()
             
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                _, loss = model(xb, yb)
-                loss = loss/grad_accum_steps
+            with context: 
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    _, loss = model(xb, yb)
+                    loss = loss / grad_accum_steps
             
-            # Scaling the gradients as we are using fp16
-            scaled_loss = scaler.scale(loss) # loss is scaled and
-            scaled_loss.backward() # as a result the gradients (param.grad) are also scaled which prevents underflow
-            loss_accum += loss.detach()
+                # Scaling the gradients as we are using fp16
+                scaled_loss = scaler.scale(loss) # loss is scaled and
+                scaled_loss.backward() # as a result the gradients (param.grad) are also scaled which prevents underflow
+                loss_accum += loss.detach()
         
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
@@ -280,7 +272,7 @@ def main():
         loss_accum = loss_accum.item()
 
         if  master_process:
-            if step == start_step:
+            if step == 0:
                 running_train_loss = loss_accum
             else:
                 running_train_loss = 0.99 * running_train_loss + 0.01 * loss_accum
@@ -350,17 +342,17 @@ def main():
         # Evaluation and Checkpointing
         if step >  0 and (step % eval_interval == 0 or step == max_steps - 1):
             
-            val_loss = evaluate_validation_loss(
-                model, 
-                val_loader,
-                eval_iters
-            )
+            val_loss = evaluate_validation_loss(model, val_loader, eval_iters)
 
             if master_process:
-
                 logger.info(f"EVAL | Step: {step:5d}  | Val Loss: {val_loss:.4f}")
                 wandb.log({"val/loss": val_loss,}, step=step)
                 
+                is_best = val_loss < best_val_loss
+
+                if is_best:
+                    best_val_loss = val_loss
+
                 checkpoint = {
                     "model": raw_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
@@ -368,24 +360,23 @@ def main():
                     "train_loader": train_loader.state_dict(),
                     "step": step,
                     "config": dataclasses.asdict(config),
-                    "val_loss": val_loss
+                    "best_val_loss": best_val_loss,
+                    "running_train_loss": running_train_loss,
+                    "wandb_id": wandb.run.id if wandb is not None else None
                 }
 
                 # Always save the latest state for crash recovery
                 torch.save(checkpoint, f"{out_dir}/ckpt_latest.pt")
 
                 # Save if the model has a better val_loss
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if is_best:
                     torch.save(checkpoint, f"{out_dir}/ckpt_best.pt")
                     logger.info(f"New best model saved with Val Loss: {best_val_loss:.4f}")
             
             if ddp:
                 dist.barrier()
-            
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
-            
             t0 = time.time()
                 
     if ddp:

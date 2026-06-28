@@ -26,8 +26,8 @@ n_layer    = 12
 ### TRAINING CONFIG
 vocab_size_padded = 50304           # GPT2Tokenizer vocab_size + padding
 max_steps         = 35_000
-eval_interval     = 1000
-eval_iters        = 100
+eval_interval     = 500
+eval_iters        = 50
 stats_iter        = 100
 global_batch_size = 256
 batch_size        = 16

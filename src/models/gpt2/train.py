@@ -6,7 +6,7 @@ import argparse
 import logging
 import wandb
 import numpy as np
-import dataclasses
+from dataclasses import asdict
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -30,7 +30,7 @@ eval_interval     = 500
 eval_iters        = 25
 stats_iter        = 100
 global_batch_size = 256
-batch_size        = 16
+batch_size        = 1
 max_lr            = 6e-4
 min_lr            = 6e-5
 warmup_steps      = max_steps // 20 # 5% of max_steps
@@ -39,6 +39,14 @@ warmup_steps      = max_steps // 20 # 5% of max_steps
 parser = argparse.ArgumentParser(description="Train GPT2")
 parser.add_argument("--dataset-path", required=True)
 parser.add_argument("--resume", action="store_true")
+parser.add_argument("--max-steps", type=int, default=max_steps, help="Total training steps")
+parser.add_argument("--eval-interval", type=int, default=eval_interval, help="Steps between validation runs")
+parser.add_argument("--eval-iters", type=int, default=eval_iters, help="Batches to average for validation loss")
+parser.add_argument("--stats-iter", type=int, default=stats_iter, help="Steps between logging perf stats")
+parser.add_argument("--global-batch-size", type=int, default=global_batch_size, help="Total tokens-worth of batch across all GPUs (in samples)")
+parser.add_argument("--batch-size", type=int, default=batch_size, help="Per-GPU micro-batch size")
+parser.add_argument("--max-lr", type=float, default=max_lr, help="Peak learning rate")
+parser.add_argument("--min-lr", type=float, default=min_lr, help="Final (cosine-decayed) learning rate")
 
 
 def set_seed(base_seed=1337, rank=0):
@@ -62,7 +70,22 @@ def get_lr(step):
 
 
 def main():
+    # These are set as module-level globals since get_lr() and the rest of
+    # the training loop reference them directly (no config object passed around).
+    global max_steps, eval_interval, eval_iters, stats_iter
+    global global_batch_size, batch_size, max_lr, min_lr, warmup_steps
+
     args = parser.parse_args()
+
+    max_steps         = args.max_steps
+    eval_interval     = args.eval_interval
+    eval_iters        = args.eval_iters
+    stats_iter        = args.stats_iter
+    global_batch_size = args.global_batch_size
+    batch_size        = args.batch_size
+    max_lr            = args.max_lr
+    min_lr            = args.min_lr
+    warmup_steps      = max_steps // 20  # recompute: depends on max_steps
 
     ddp = int(os.environ.get('RANK', -1)) != -1
 
@@ -354,7 +377,7 @@ def main():
                     "scaler": scaler.state_dict(),
                     "train_loader": train_loader.state_dict(),
                     "step": step,
-                    "config": dataclasses.asdict(config),
+                    "config": asdict(config),
                     "best_val_loss": best_val_loss,
                     "running_train_loss": running_train_loss,
                     "wandb_id": wandb.run.id if wandb is not None else None

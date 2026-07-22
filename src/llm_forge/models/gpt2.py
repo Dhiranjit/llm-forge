@@ -8,32 +8,33 @@ import torch.nn.functional as F
 
 @dataclass
 class GPTConfig:
-    vocab_size : int = 50304
-    block_size : int = 1024
-    n_embd    : int = 768
-    n_head     : int = 12
-    n_layer    : int = 12
+    vocab_size : int 
+    block_size : int 
+    n_embd     : int 
+    n_head     : int
+    n_layer    : int
+
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        assert cfg.n_embd % cfg.n_head == 0
 
-        self.n_embd   = config.n_embd
-        self.n_head    = config.n_head
-        self.head_size = config.n_embd // config.n_head
+        self.n_embd   = cfg.n_embd
+        self.n_head    = cfg.n_head
+        self.head_size = cfg.n_embd // cfg.n_head
 
         # Key, query, value projections for all heads, combined in a single linear layer
         # (C, hs) for each of k, q, v in a single head -> (C, hs * nh) -> (C, C) for each k, q, v
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
 
         # Output projection (C, C)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
         self.c_proj.SCALE_INIT = True # Scale residual projection init by 1/sqrt(2*n_layer)
 
         # Causal Mask (Not needed with flash attention)
-        # self.register_buffer("tril", torch.tril(torch.ones(config.block_size, config.block_size)), persistent=False)
+        # self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)), persistent=False)
     
     def forward(self, x):
         B, T, C = x.shape
@@ -72,12 +73,12 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.Linear(cfg.n_embd, 4 * cfg.n_embd),
             nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Linear(4 * cfg.n_embd, cfg.n_embd),
         )
         self.net[2].SCALE_INIT = True # Scale residual projection init by 1/sqrt(2*n_layer)
     
@@ -86,15 +87,15 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
         # Layer Normalization
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.ln1 = nn.LayerNorm(cfg.n_embd)
+        self.ln2 = nn.LayerNorm(cfg.n_embd)
 
         # Core sub-layers
-        self.attn  = CausalSelfAttention(config)
-        self.mlp = MLP(config)
+        self.attn  = CausalSelfAttention(cfg)
+        self.mlp = MLP(cfg)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -103,25 +104,25 @@ class Block(nn.Module):
 
 
 class GPT2(nn.Module):
-    def __init__(self, config):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
         
-        self.config = config
+        self.cfg = cfg
         # Token + Positional embeddings
-        self.token_embedding  = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_embedding    = nn.Embedding(config.block_size, config.n_embd)
+        self.token_embedding  = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.pos_embedding    = nn.Embedding(cfg.block_size, cfg.n_embd)
 
         # Transformer Blocks
         self.blocks = nn.ModuleList(
-            [Block(config) for _ in range(config.n_layer)]
+            [Block(cfg) for _ in range(cfg.n_layer)]
         )
         
         # Final LayerNorm and Language Model Head
-        self.ln_f = nn.LayerNorm(config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight # Weight tying (Reduces the param count and force the model to learn a better representation)
 
-        self.register_buffer("position_ids", torch.arange(config.block_size), persistent=False)
+        self.register_buffer("position_ids", torch.arange(cfg.block_size), persistent=False)
 
         # Initialize weights (GPT-2 style)
         self.apply(self._init_weights)
@@ -130,7 +131,7 @@ class GPT2(nn.Module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if getattr(module, "SCALE_INIT", False):
-                std *= (2 * self.config.n_layer) ** -0.5
+                std *= (2 * self.cfg.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -165,21 +166,10 @@ class GPT2(nn.Module):
     def generate(self, idx, max_new_tokens, temperature=1.0):
         """Streams tokens one step at a time. Yields the new token (B, 1) each step."""
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:]
+            idx_cond = idx[:, -self.cfg.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature # Take only the last time step (B, vocab_size)
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
             yield idx_next
-
-
-
-        
-
-
-
-
-
-
-

@@ -51,10 +51,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Update train_cfg if an arg has been provided
     for key, value in vars(args).items():
-        attr = key.replace("-", "_")
-        if hasattr(train_cfg, attr):
-            setattr(train_cfg, attr, value)
+        if hasattr(train_cfg, key):
+            setattr(train_cfg, key, value)
 
     ddp = int(os.environ.get('RANK', -1)) != -1
 
@@ -64,7 +64,7 @@ def main():
         ddp_local_rank = int(os.environ['LOCAL_RANK'])  # ID on this specific machine
         ddp_world_size = int(os.environ['WORLD_SIZE'])  # Total number of GPUs in the cluster
 
-        # Bind this specific process to iIts designated GPU
+        # Bind this specific process to its designated GPU
         device = f'cuda:{ddp_local_rank}'
         torch.cuda.set_device(device)
 
@@ -83,15 +83,10 @@ def main():
         "Global batch size must be cleanly divisible by (micro_batch_size * world_size)"
      
     # Replication
-    set_seed(base_seed=1337, rank=ddp_rank)
+    set_seed(base_seed=1337, ddp_rank=ddp_rank)
 
     grad_accum_steps = train_cfg.global_batch_size // (train_cfg.batch_size * ddp_world_size)
 
-    if master_process:
-        print(f"Global batch size: {train_cfg.global_batch_size}")
-        print(f"Batch size: {train_cfg.batch_size}")
-        print(f"Gradient accumulation steps per GPU: {grad_accum_steps}")
-    
     # Paths
     data_dir     = args.dataset_path
     out_dir      = args.our_dir
@@ -111,6 +106,10 @@ def main():
                 logging.StreamHandler()         
             ]
         )
+
+        logger.info(f"Global batch size: {train_cfg.global_batch_size}")
+        logger.info(f"Batch size: {train_cfg.batch_size}")
+        logger.info(f"Gradient accumulation steps per GPU: {grad_accum_steps}")
     
     train_loader = DataLoader(
         data_path=data_dir,
@@ -135,7 +134,7 @@ def main():
     # Model Initialization
     model = GPT2(model_cfg).to(device)
 
-    raw_model = model # Pure reference for clean checkpoints
+    raw_model = model # pure model reference for clean checkpointing
 
     if master_process:
         params_count = sum(p.numel() for p in model.parameters())
@@ -161,7 +160,7 @@ def main():
     # Mixed precision training context manager
     scaler = torch.amp.GradScaler()
 
-    # Initializing va
+    # Initializing training states
     start_step = 0
     best_val_loss = float('inf')
     running_train_loss = 0.0
@@ -217,7 +216,7 @@ def main():
             xb, yb = train_loader.next_batch() 
             is_last_step = (accum_step == grad_accum_steps - 1)
             
-            # To prevent recompuation of gradients
+            # To prevent reducing of gradient in every steps
             context = model.no_sync() if ddp and not is_last_step else contextlib.nullcontext()
             
             with context: 
@@ -258,6 +257,7 @@ def main():
         scaler.update()
         optimizer.zero_grad(set_to_none=True)  
 
+        # Periodic Logging
         if step == start_step:
             if device.startswith("cuda"):
                 torch.cuda.synchronize()

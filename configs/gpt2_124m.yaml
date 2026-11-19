@@ -1,0 +1,22 @@
+model:
+  arch: gpt2
+  vocab_size: 50304
+  max_seq_len: 1024
+  n_embd: 768
+  n_head: 12
+  n_layer: 12
+
+data:
+  data_dir: data/fineweb_edu
+  seq_len: 256
+
+train:
+  max_steps: 35000
+  eval_interval: 500
+  eval_iters: 25
+  stats_iter: 100
+  global_batch_size: 256
+  micro_batch_size: 16
+  max_lr: 6.0e-4
+  min_lr: 6.0e-5
+  warmup_steps: 1750

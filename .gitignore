@@ -4,4 +4,6 @@ __pycache__/
 wandb/
 checkpoints/
 .venv/
-CLAUDE.md
+
+AGENTS.md
+DESIGN.md

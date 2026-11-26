@@ -7,16 +7,21 @@ model:
   n_layer: 12
 
 data:
-  data_dir: data/fineweb_edu
+  data_dir: data
   seq_len: 256
+  datasets:
+    fineweb_edu: 0.50
+    cosmopedia_v2: 0.25
+    stack_python: 0.15
+    finemath: 0.10
 
 train:
   max_steps: 35000
+  batch_size: 16
+  grad_accum_steps: 16
+  lr: 6.0e-4
+  warmup_steps: 1750
   eval_interval: 500
   eval_iters: 25
-  stats_iter: 100
-  global_batch_size: 256
-  micro_batch_size: 16
-  max_lr: 6.0e-4
-  min_lr: 6.0e-5
-  warmup_steps: 1750
+  log_interval: 100
+  seed: 1337

@@ -1,0 +1,27 @@
+model:
+  arch: gpt2
+  vocab_size: 50304
+  max_seq_len: 256
+  n_embd: 128
+  n_head: 4
+  n_layer: 4
+
+data:
+  data_dir: data
+  seq_len: 256
+  datasets:
+    fineweb_edu: 0.50
+    cosmopedia_v2: 0.25
+    stack_python: 0.15
+    finemath: 0.10
+
+train:
+  max_steps: 3000
+  batch_size: 16
+  grad_accum_steps: 2
+  lr: 1.0e-3
+  warmup_steps: 150
+  eval_interval: 500
+  eval_iters: 20
+  log_interval: 100
+  seed: 1337
